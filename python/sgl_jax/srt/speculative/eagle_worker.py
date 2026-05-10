@@ -162,6 +162,15 @@ class EAGLEWorker(ModelWorker):
             if _PROF:
                 jax.block_until_ready(batch_output.accept_lens)
                 _t2 = time.perf_counter()
+                if model_worker_batch.real_bs > 1:
+                    logger.info(
+                        "[EAGLE-DBG] bs=%d accept=%s draft0=%s",
+                        model_worker_batch.real_bs,
+                        batch_output.accept_lens.tolist(),
+                        np.asarray(model_worker_batch.spec_info.draft_token)[
+                            : model_worker_batch.real_bs * 4
+                        ].tolist(),
+                    )
             self.draft_extend_after_verify(model_worker_batch, batch_output)
             if _PROF:
                 jax.block_until_ready(batch_output.next_draft_input.topk_p)
