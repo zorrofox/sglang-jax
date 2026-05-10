@@ -687,20 +687,32 @@ class EAGLEWorker(ModelWorker):
         forward_batch.spec_info.hidden_states = jnp.empty((bs * self.topk, hidden_states.shape[1]))
         for i in range(self.speculative_num_steps):
 
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            # update_eagle_lists and update_forward_batch_info this two function will make accept rate very low if be jitted
-            # FIXME we should find it out why lead this ?
-            score_list, token_list, parents_list = update_eagle_lists(
-                i, score_list, token_list, parents_list, tree_info, self.topk
+            (
+                input_ids,
+                hidden_states,
+                scores,
+                positions,
+                score_list,
+                token_list,
+                parents_list,
+            ) = _draft_step_pre(
+                i,
+                topk_p,
+                topk_index,
+                hidden_states,
+                scores,
+                score_list,
+                token_list,
+                parents_list,
+                positions_base,
+                self.topk,
             )
             if i == self.speculative_num_steps - 1:
                 break
 
-            forward_batch = update_forward_batch_info(
-                forward_batch, i, input_ids, hidden_states, positions_base
-            )
+            forward_batch.input_ids = input_ids
+            forward_batch.spec_info.hidden_states = hidden_states
+            forward_batch.positions = positions
             self.draft_model_runner.attn_backend.forward_metadata = metadata_per_step[i]
 
             # Run forward
@@ -808,6 +820,34 @@ class EAGLEWorker(ModelWorker):
 
 
 @functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["i", "topk"])
+def _draft_step_pre(
+    i: int,
+    topk_p: jax.Array,
+    topk_index: jax.Array,
+    hidden_states: jax.Array,
+    scores,
+    score_list: jax.Array,
+    token_list: jax.Array,
+    parents_list: jax.Array,
+    positions_base: jax.Array,
+    topk: int,
+):
+    """select_top_k + update_eagle_lists + positions in one dispatch."""
+    if i == 0:
+        input_ids, hidden_states, scores, tree_info = select_top_k_tokens_step_0(
+            topk_p, topk_index, hidden_states, scores, topk
+        )
+    else:
+        input_ids, hidden_states, scores, tree_info = select_top_k_tokens_step_greater_0(
+            jnp.asarray(i), topk_p, topk_index, hidden_states, scores, topk
+        )
+    score_list, token_list, parents_list = update_eagle_lists(
+        i, score_list, token_list, parents_list, tree_info, topk
+    )
+    return input_ids, hidden_states, scores, positions_base + i, score_list, token_list, parents_list
+
+
 @functools.partial(jax.jit, static_argnames=["topk"])
 def _dext_post_forward(
     next_token_logits: jax.Array, hidden_states: jax.Array, select_index: jax.Array, topk: int
