@@ -496,10 +496,14 @@ class EagleDraftInput:
         speculative_num_draft_tokens: int,
     ):
         model_worker_batch.spec_info = self
+        # dext writes draft-KV for the speculative_num_draft_tokens new tokens at
+        # positions [verified_seq_len, verified_seq_len + draft). The kernel writes
+        # to offset [kv_len - q_len, kv_len), so kv_len must equal
+        # verified_seq_len + draft. seq_lens here is post-verify (already -1'd by
+        # prepare_for_verify to verified_seq_len), so add draft (not draft-1).
         model_worker_batch.seq_lens[: model_worker_batch.real_bs] = (
             model_worker_batch.seq_lens[: model_worker_batch.real_bs]
             + speculative_num_draft_tokens
-            - 1
         )
         bs = batch_output.accept_lens.shape[0]
         step_plus_1 = model_worker_batch.input_ids.shape[0] // bs
