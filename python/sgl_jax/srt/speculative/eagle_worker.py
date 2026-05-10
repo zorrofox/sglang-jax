@@ -449,7 +449,7 @@ class EAGLEWorker(ModelWorker):
             retrive_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
-            jax.device_put(model_worker_batch.spec_info.verified_id, NamedSharding(self.mesh, P())),
+            model_worker_batch.spec_info.verified_id,
             score_list,
             token_list,
             parents_list,
@@ -533,9 +533,17 @@ class EAGLEWorker(ModelWorker):
             self.model_runner.rngs,
             self.mesh,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[accept_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[accept_index]
+        accept_index_dev = device_array(accept_index, sharding=NamedSharding(self.mesh, P()))
+        (
+            logits_output.next_token_logits,
+            logits_output.hidden_states,
+            model_worker_batch.positions,
+        ) = _verify_post_gather(
+            logits_output.next_token_logits,
+            logits_output.hidden_states,
+            model_worker_batch.positions,
+            accept_index_dev,
+        )
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
@@ -855,6 +863,11 @@ class EAGLEWorker(ModelWorker):
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
+
+
+@jax.jit
+def _verify_post_gather(logits, hidden, positions, accept_index):
+    return logits[accept_index, :], hidden[accept_index, :], positions[accept_index]
 
 
 @functools.partial(jax.jit, static_argnames=["i", "topk"])
