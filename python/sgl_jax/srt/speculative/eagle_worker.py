@@ -533,17 +533,9 @@ class EAGLEWorker(ModelWorker):
             self.model_runner.rngs,
             self.mesh,
         )
-        accept_index_dev = device_array(accept_index, sharding=NamedSharding(self.mesh, P()))
-        (
-            logits_output.next_token_logits,
-            logits_output.hidden_states,
-            model_worker_batch.positions,
-        ) = _verify_post_gather(
-            logits_output.next_token_logits,
-            logits_output.hidden_states,
-            model_worker_batch.positions,
-            accept_index_dev,
-        )
+        logits_output.next_token_logits = logits_output.next_token_logits[accept_index, :]
+        logits_output.hidden_states = logits_output.hidden_states[accept_index, :]
+        model_worker_batch.positions = model_worker_batch.positions[accept_index]
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
