@@ -295,7 +295,7 @@ class EAGLEWorker(ModelWorker):
     ):
         rep = NamedSharding(self.mesh, P())
         topk_p, topk_index = topk_probs_from_logits(
-            self._reshard_logits(logits_output.next_token_logits), self.topk
+            logits_output.next_token_logits, self.topk
         )
         draft_input.topk_p = jax.device_put(topk_p, rep)
         draft_input.topk_index = jax.device_put(topk_index, rep)
@@ -715,7 +715,7 @@ class EAGLEWorker(ModelWorker):
             )
 
             topk_p, topk_index = topk_probs_from_logits(
-                self._reshard_logits(logits_output.next_token_logits), self.topk
+                logits_output.next_token_logits, self.topk
             )
 
             if self.hot_token_ids is not None:
@@ -820,6 +820,11 @@ def topk_probs_from_logits(
 ) -> tuple[jax.Array, jax.Array]:
     """Return top-k probabilities without materializing the full softmax tensor."""
     working_logits = jnp.moveaxis(logits, axis, -1) if axis != -1 else logits
+    # logits arrive vocab-sharded; replicate inside jit so callers don't need
+    # a separate host-side device_put round-trip per step.
+    sh = jax.typeof(working_logits).sharding
+    if isinstance(sh, NamedSharding):
+        working_logits = jax.sharding.reshard(working_logits, NamedSharding(sh.mesh, P()))
     topk_logits, topk_index = jax.lax.top_k(working_logits, topk)
     logsumexp = jax.nn.logsumexp(working_logits, axis=-1, keepdims=True)
     topk_probs = jnp.exp(topk_logits - logsumexp)
