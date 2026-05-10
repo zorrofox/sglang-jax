@@ -2661,6 +2661,12 @@ class ModelWorkerSamplingInfo:
     def __len__(self) -> int:
         return len(self.temperatures)
 
+    def filter_batch(self, indices) -> None:
+        self.temperatures = self.temperatures[indices]
+        self.top_ps = self.top_ps[indices]
+        self.top_ks = self.top_ks[indices]
+        self.min_ps = self.min_ps[indices]
+
     # Basic batched sampling params
     temperatures: np.ndarray
     top_ps: np.ndarray
