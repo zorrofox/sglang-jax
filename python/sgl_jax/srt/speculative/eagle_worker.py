@@ -147,13 +147,32 @@ class EAGLEWorker(ModelWorker):
             return batch_output
 
         else:
+            import os
+
+            _PROF = os.environ.get("EAGLE_PROFILE") == "1"
             cur_allocate_lens = model_worker_batch.spec_info.allocate_lens
+            if _PROF:
+                jax.block_until_ready(cur_allocate_lens)
+                _t0 = time.perf_counter()
             self.draft(model_worker_batch)
-
+            if _PROF:
+                jax.block_until_ready(model_worker_batch.spec_info.draft_token)
+                _t1 = time.perf_counter()
             batch_output = self.verify(model_worker_batch, cur_allocate_lens)
-
+            if _PROF:
+                jax.block_until_ready(batch_output.accept_lens)
+                _t2 = time.perf_counter()
             self.draft_extend_after_verify(model_worker_batch, batch_output)
-
+            if _PROF:
+                jax.block_until_ready(batch_output.next_draft_input.topk_p)
+                _t3 = time.perf_counter()
+                logger.info(
+                    "[EAGLE-PROF] draft=%.1fms verify=%.1fms dext=%.1fms total=%.1fms",
+                    (_t1 - _t0) * 1e3,
+                    (_t2 - _t1) * 1e3,
+                    (_t3 - _t2) * 1e3,
+                    (_t3 - _t0) * 1e3,
+                )
             return batch_output
 
     def forward_target_extend(
