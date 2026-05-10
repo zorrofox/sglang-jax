@@ -664,6 +664,18 @@ class EAGLEWorker(ModelWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
+        import os as _os
+
+        if _os.environ.get("EAGLE_PROFILE") == "1" and model_worker_batch.real_bs > 1:
+            logger.info(
+                "[DEXT-DBG] bs=%d input_ids.shape=%s out_cache_loc=%s positions=%s seq_lens=%s req_pool=%s",
+                model_worker_batch.real_bs,
+                np.asarray(forward_batch.input_ids).shape,
+                np.asarray(forward_batch.out_cache_loc).tolist(),
+                np.asarray(forward_batch.positions).tolist(),
+                np.asarray(model_worker_batch.seq_lens).tolist(),
+                np.asarray(model_worker_batch.req_pool_indices).tolist(),
+            )
         draft_logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=logits_meatadata,
