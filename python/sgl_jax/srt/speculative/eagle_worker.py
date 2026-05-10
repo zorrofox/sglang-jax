@@ -676,14 +676,15 @@ class EAGLEWorker(ModelWorker):
         import os as _os
 
         if _os.environ.get("EAGLE_PROFILE") == "1" and model_worker_batch.real_bs > 1:
+            md = self.draft_model_runner.attn_backend.forward_metadata
             logger.info(
-                "[DEXT-DBG] bs=%d input_ids.shape=%s out_cache_loc=%s positions=%s seq_lens=%s req_pool=%s",
+                "[DEXT-DBG] bs=%d seq_lens=%s page_idx[:8]=%s cu_kv=%s cu_q=%s alloc=%s",
                 model_worker_batch.real_bs,
-                np.asarray(forward_batch.input_ids).shape,
-                np.asarray(forward_batch.out_cache_loc).tolist(),
-                np.asarray(forward_batch.positions).tolist(),
                 np.asarray(model_worker_batch.seq_lens).tolist(),
-                np.asarray(model_worker_batch.req_pool_indices).tolist(),
+                np.asarray(md.page_indices)[:8].tolist(),
+                np.asarray(md.cu_kv_lens).tolist(),
+                np.asarray(md.cu_q_lens).tolist(),
+                np.asarray(model_worker_batch.spec_info.allocate_lens).tolist(),
             )
         draft_logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,

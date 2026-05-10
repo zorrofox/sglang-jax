@@ -181,7 +181,6 @@ def get_last_loc_large_page_size_large_top_k(
     return prefix_lens, new_seq_lens, last_loc, num_new_pages_per_topk, extend_lens
 
 
-@jax.jit(static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"])
 @functools.partial(
     jax.jit, static_argnames=["num_verify_tokens", "batch_size", "speculative_num_steps"]
 )
