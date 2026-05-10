@@ -199,9 +199,10 @@ class EAGLEWorker(ModelWorker):
         next_token_ids: jax.Array,
     ):
         # FIXME(pc) move this all prepare to prepare_for_extend_after_target_prefill
+        verified_id_np = np.asarray(jax.device_get(next_token_ids))[: model_worker_batch.real_bs]
         model_worker_batch.spec_info = EagleDraftInput(
             hidden_states=hidden_states,
-            verified_id=next_token_ids[: model_worker_batch.real_bs],
+            verified_id=verified_id_np,
             num_tokens_per_batch=np.asarray(1, dtype=jnp.int32),
             num_tokens_for_logprob_per_batch=np.asarray(1, dtype=jnp.int32),
             allocate_lens=model_worker_batch.seq_lens,
