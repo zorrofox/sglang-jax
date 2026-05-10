@@ -533,9 +533,18 @@ class EAGLEWorker(ModelWorker):
             self.model_runner.rngs,
             self.mesh,
         )
-        logits_output.next_token_logits = logits_output.next_token_logits[accept_index, :]
-        logits_output.hidden_states = logits_output.hidden_states[accept_index, :]
-        model_worker_batch.positions = model_worker_batch.positions[accept_index]
+        # accept_index uses -1 for rejected slots; gathering positions/hidden with
+        # -1 picks the *global* last element (= last req's last draft pos). dext
+        # then writes those rejected tokens' draft-KV at that foreign position
+        # inside *each* req's own page, corrupting prefix KV for all but the last
+        # req. Redirect -1 to each req's own last draft index so the junk write
+        # lands on a slot that req will never read (beyond its accept length).
+        draft_n = self.speculative_num_draft_tokens
+        per_req_last = (np.arange(len(accept_index)) // draft_n) * draft_n + draft_n - 1
+        safe_index = np.where(accept_index >= 0, accept_index, per_req_last)
+        logits_output.next_token_logits = logits_output.next_token_logits[safe_index, :]
+        logits_output.hidden_states = logits_output.hidden_states[safe_index, :]
+        model_worker_batch.positions = model_worker_batch.positions[safe_index]
         new_seq_lens = model_worker_batch.seq_lens + accept_length
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
