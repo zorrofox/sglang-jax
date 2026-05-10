@@ -163,10 +163,15 @@ class EAGLEWorker(ModelWorker):
                 jax.block_until_ready(batch_output.accept_lens)
                 _t2 = time.perf_counter()
                 if model_worker_batch.real_bs > 1:
+                    rb = model_worker_batch.real_bs
+                    nd = self.speculative_num_draft_tokens
                     logger.info(
-                        "[EAGLE-DBG] bs=%d accept=%s",
-                        model_worker_batch.real_bs,
-                        batch_output.accept_lens[: model_worker_batch.real_bs].tolist(),
+                        "[EAGLE-DBG] bs=%d accept=%s predict=%s",
+                        rb,
+                        batch_output.accept_lens[:rb].tolist(),
+                        np.asarray(batch_output.next_token_ids)[: rb * nd]
+                        .reshape(rb, nd)
+                        .tolist(),
                     )
             self.draft_extend_after_verify(model_worker_batch, batch_output)
             if _PROF:
