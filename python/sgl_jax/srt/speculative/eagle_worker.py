@@ -819,7 +819,6 @@ class EAGLEWorker(ModelWorker):
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
 
 
-@functools.partial(jax.jit, static_argnames=["topk"])
 @functools.partial(jax.jit, static_argnames=["i", "topk"])
 def _draft_step_pre(
     i: int,
@@ -880,6 +879,7 @@ def _draft_post_forward(
     return jnp.exp(topk_logits - lse), topk_index, hidden_states
 
 
+@functools.partial(jax.jit, static_argnames=["topk"])
 def topk_probs_from_logits(
     logits: jax.Array, topk: int, axis: int = -1
 ) -> tuple[jax.Array, jax.Array]:
