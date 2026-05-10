@@ -164,12 +164,9 @@ class EAGLEWorker(ModelWorker):
                 _t2 = time.perf_counter()
                 if model_worker_batch.real_bs > 1:
                     logger.info(
-                        "[EAGLE-DBG] bs=%d accept=%s draft0=%s",
+                        "[EAGLE-DBG] bs=%d accept=%s",
                         model_worker_batch.real_bs,
-                        batch_output.accept_lens.tolist(),
-                        np.asarray(model_worker_batch.spec_info.draft_token)[
-                            : model_worker_batch.real_bs * 4
-                        ].tolist(),
+                        batch_output.accept_lens[: model_worker_batch.real_bs].tolist(),
                     )
             self.draft_extend_after_verify(model_worker_batch, batch_output)
             if _PROF:
