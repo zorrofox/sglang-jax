@@ -253,42 +253,19 @@ class EAGLEWorker(ModelWorker):
         self.capture_for_decode(logits_output, forward_batch.spec_info)
 
     def copy_model_worker_batch_to_cpu(self, model_worker_batch: ModelWorkerBatch):
-        model_worker_batch.input_ids = np.array(
-            jax.device_get(model_worker_batch.input_ids), dtype=model_worker_batch.input_ids.dtype
+        names = (
+            "input_ids",
+            "seq_lens",
+            "out_cache_loc",
+            "positions",
+            "req_pool_indices",
+            "cache_loc",
+            "extend_prefix_lens",
+            "extend_seq_lens",
         )
-        model_worker_batch.seq_lens = np.array(
-            jax.device_get(model_worker_batch.seq_lens), dtype=model_worker_batch.seq_lens.dtype
-        )
-        model_worker_batch.out_cache_loc = np.array(
-            jax.device_get(model_worker_batch.out_cache_loc),
-            dtype=model_worker_batch.out_cache_loc.dtype,
-        )
-        model_worker_batch.positions = np.array(
-            jax.device_get(model_worker_batch.positions), dtype=model_worker_batch.positions.dtype
-        )
-        model_worker_batch.req_pool_indices = np.array(
-            jax.device_get(model_worker_batch.req_pool_indices),
-            dtype=model_worker_batch.req_pool_indices.dtype,
-        )
-        model_worker_batch.cache_loc = np.array(
-            jax.device_get(model_worker_batch.cache_loc), dtype=model_worker_batch.cache_loc.dtype
-        )
-        model_worker_batch.extend_prefix_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_prefix_lens),
-                dtype=model_worker_batch.extend_prefix_lens.dtype,
-            )
-            if model_worker_batch.extend_prefix_lens is not None
-            else None
-        )
-        model_worker_batch.extend_seq_lens = (
-            np.array(
-                jax.device_get(model_worker_batch.extend_seq_lens),
-                dtype=model_worker_batch.extend_seq_lens.dtype,
-            )
-            if model_worker_batch.extend_seq_lens is not None
-            else None
-        )
+        vals = jax.device_get(tuple(getattr(model_worker_batch, n) for n in names))
+        for n, v in zip(names, vals, strict=True):
+            setattr(model_worker_batch, n, np.asarray(v) if v is not None else None)
 
     @property
     def draft_model_runner(self):
@@ -653,25 +630,21 @@ class EAGLEWorker(ModelWorker):
             forward_batch,
             logits_metadata=logits_meatadata,
         )
-        rep = NamedSharding(self.mesh, P())
-        draft_logits_output.next_token_logits = jax.device_put(
-            draft_logits_output.next_token_logits, rep
-        )
-        draft_logits_output.hidden_states = jax.device_put(draft_logits_output.hidden_states, rep)
         select_index = (
             np.arange(len(model_worker_batch.seq_lens[: model_worker_batch.real_bs]))
             * (self.speculative_num_steps + 1)
             + batch_output.accept_lens[: model_worker_batch.real_bs]
             - 1
         )
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[select_index]
-        draft_logits_output.hidden_states = draft_logits_output.hidden_states[select_index]
-        topk_p, topk_index = topk_probs_from_logits(
-            draft_logits_output.next_token_logits, self.topk
+        topk_p, topk_index, hidden_sel = _dext_post_forward(
+            draft_logits_output.next_token_logits,
+            draft_logits_output.hidden_states,
+            device_array(select_index, sharding=NamedSharding(self.mesh, P())),
+            self.topk,
         )
 
         # prepare for next draft decode
-        batch_output.next_draft_input.hidden_states = draft_logits_output.hidden_states
+        batch_output.next_draft_input.hidden_states = hidden_sel
         batch_output.next_draft_input.topk_p = topk_p
         batch_output.next_draft_input.topk_index = topk_index
         batch_output.next_draft_input.verified_id = batch_output.next_draft_input.verified_id[
@@ -737,15 +710,12 @@ class EAGLEWorker(ModelWorker):
                 logits_metadata=logits_metadata,
             )
 
-            topk_p, topk_index = topk_probs_from_logits(
-                logits_output.next_token_logits, self.topk
+            topk_p, topk_index, hidden_states = _draft_post_forward(
+                logits_output.next_token_logits, logits_output.hidden_states, self.topk
             )
 
             if self.hot_token_ids is not None:
                 topk_index = self.hot_token_ids[topk_index]
-            hidden_states = jax.device_put(
-                logits_output.hidden_states, NamedSharding(self.mesh, P())
-            )
 
         return score_list, token_list, parents_list
 
@@ -838,6 +808,38 @@ class EAGLEWorker(ModelWorker):
 
 
 @functools.partial(jax.jit, static_argnames=["topk"])
+@functools.partial(jax.jit, static_argnames=["topk"])
+def _dext_post_forward(
+    next_token_logits: jax.Array, hidden_states: jax.Array, select_index: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fuse reshard + per-req gather + top_k after draft_extend into one dispatch."""
+    sh = jax.typeof(next_token_logits).sharding
+    if isinstance(sh, NamedSharding):
+        rep = NamedSharding(sh.mesh, P())
+        next_token_logits = jax.sharding.reshard(next_token_logits, rep)
+        hidden_states = jax.sharding.reshard(hidden_states, rep)
+    next_token_logits = next_token_logits[select_index]
+    hidden_states = hidden_states[select_index]
+    topk_logits, topk_index = jax.lax.top_k(next_token_logits, topk)
+    lse = jax.nn.logsumexp(next_token_logits, axis=-1, keepdims=True)
+    return jnp.exp(topk_logits - lse), topk_index, hidden_states
+
+
+@functools.partial(jax.jit, static_argnames=["topk"])
+def _draft_post_forward(
+    next_token_logits: jax.Array, hidden_states: jax.Array, topk: int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Fuse the per-step reshard + top_k after draft forward into one dispatch."""
+    sh = jax.typeof(next_token_logits).sharding
+    if isinstance(sh, NamedSharding):
+        rep = NamedSharding(sh.mesh, P())
+        next_token_logits = jax.sharding.reshard(next_token_logits, rep)
+        hidden_states = jax.sharding.reshard(hidden_states, rep)
+    topk_logits, topk_index = jax.lax.top_k(next_token_logits, topk)
+    lse = jax.nn.logsumexp(next_token_logits, axis=-1, keepdims=True)
+    return jnp.exp(topk_logits - lse), topk_index, hidden_states
+
+
 def topk_probs_from_logits(
     logits: jax.Array, topk: int, axis: int = -1
 ) -> tuple[jax.Array, jax.Array]:

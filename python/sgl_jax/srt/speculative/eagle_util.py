@@ -905,9 +905,9 @@ class EagleVerifyInput:
                 rng=rng,
             )
 
-        predict = np.asarray(jax.device_get(predict))
-        accept_index = np.asarray(jax.device_get(accept_index))
-        accept_length = np.asarray(jax.device_get(accept_length))
+        predict, accept_index, accept_length = (
+            np.asarray(a) for a in jax.device_get((predict, accept_index, accept_length))
+        )
 
         accept_length = accept_length + 1
         accept_index = accept_index.flatten()
