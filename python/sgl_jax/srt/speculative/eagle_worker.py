@@ -374,6 +374,17 @@ class EAGLEWorker(ModelWorker):
             cache_loc_cpu[len(cache_loc_flat) :] = 0
 
         model_worker_batch.cache_loc = cache_loc_cpu
+        import os as _os
+
+        if _os.environ.get("EAGLE_PROFILE") == "1" and len(cache_loc_flat) > 0:
+            draft_pool_sz = self.draft_model_runner.max_total_num_tokens
+            cmax = int(cache_loc_flat.max())
+            if cmax >= draft_pool_sz:
+                logger.error(
+                    "[EAGLE-DBG] draft KV OOB: cache_loc.max=%d >= draft_pool=%d (target full slot)",
+                    cmax,
+                    draft_pool_sz,
+                )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # out_cache_loc = model_worker_batch.out_cache_loc

@@ -563,6 +563,15 @@ class ModelRunnerKVCacheMixin:
         # 7. Hybrid SWA token split (existing logic, not moved)
         if self.is_hybrid:
             self.set_num_token_hybrid()
+            if (
+                not self.is_draft_worker
+                and self.spec_algorithm is not None
+                and not self.spec_algorithm.is_none()
+            ):
+                # draft shares target's allocator (range = full_max_total_num_tokens after
+                # hybrid split), so draft pool must cover the same slot range. The value
+                # set in step 5 was pre-hybrid; overwrite it with the post-hybrid size.
+                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
 
         if self.max_total_num_tokens <= 0:
             raise RuntimeError("Not enough memory. Please try to increase --mem-fraction-static.")
