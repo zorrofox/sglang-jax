@@ -162,17 +162,6 @@ class EAGLEWorker(ModelWorker):
             if _PROF:
                 jax.block_until_ready(batch_output.accept_lens)
                 _t2 = time.perf_counter()
-                if model_worker_batch.real_bs > 1:
-                    rb = model_worker_batch.real_bs
-                    nd = self.speculative_num_draft_tokens
-                    logger.info(
-                        "[EAGLE-DBG] bs=%d accept=%s predict=%s",
-                        rb,
-                        batch_output.accept_lens[:rb].tolist(),
-                        np.asarray(batch_output.next_token_ids)[: rb * nd]
-                        .reshape(rb, nd)
-                        .tolist(),
-                    )
             self.draft_extend_after_verify(model_worker_batch, batch_output)
             if _PROF:
                 jax.block_until_ready(batch_output.next_draft_input.topk_p)
@@ -351,17 +340,6 @@ class EAGLEWorker(ModelWorker):
             cache_loc_cpu[len(cache_loc_flat) :] = 0
 
         model_worker_batch.cache_loc = cache_loc_cpu
-        import os as _os
-
-        if _os.environ.get("EAGLE_PROFILE") == "1" and len(cache_loc_flat) > 0:
-            draft_pool_sz = self.draft_model_runner.max_total_num_tokens
-            cmax = int(cache_loc_flat.max())
-            if cmax >= draft_pool_sz:
-                logger.error(
-                    "[EAGLE-DBG] draft KV OOB: cache_loc.max=%d >= draft_pool=%d (target full slot)",
-                    cmax,
-                    draft_pool_sz,
-                )
         model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
 
         # out_cache_loc = model_worker_batch.out_cache_loc
@@ -426,18 +404,8 @@ class EAGLEWorker(ModelWorker):
         model_worker_batch.positions = np.empty(bs * self.topk, np.int32)
 
     def draft(self, model_worker_batch: ModelWorkerBatch):
-        import os as _os
-
-        _PROF = _os.environ.get("EAGLE_PROFILE") == "1"
-        if _PROF:
-            _d0 = time.perf_counter()
         self.padding_for_decode(model_worker_batch)
-        if _PROF:
-            _d1 = time.perf_counter()
         score_list, token_list, parents_list = self.draft_forward(model_worker_batch)
-        if _PROF:
-            jax.block_until_ready(token_list)
-            _d2 = time.perf_counter()
         verified_seq_lens = model_worker_batch.seq_lens - 1
         max_seq_len = int(np.max(verified_seq_lens)) if verified_seq_lens.size > 0 else 1
         max_context_len = self._pick_context_len(max_seq_len)
@@ -462,15 +430,6 @@ class EAGLEWorker(ModelWorker):
             model_worker_batch.speculative_num_steps,
             self.mesh,
         )
-        if _PROF:
-            jax.block_until_ready(draft_tokens)
-            _d3 = time.perf_counter()
-            logger.info(
-                "[EAGLE-DPROF] pad=%.1f loop=%.1f tree=%.1f",
-                (_d1 - _d0) * 1e3,
-                (_d2 - _d1) * 1e3,
-                (_d3 - _d2) * 1e3,
-            )
         model_worker_batch.spec_info = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
@@ -497,20 +456,12 @@ class EAGLEWorker(ModelWorker):
         return 1 << (max_seq_len - 1).bit_length()
 
     def verify(self, model_worker_batch: ModelWorkerBatch, cur_allocate_lens: jax.Array):
-        import os as _os
-
-        _PROF = _os.environ.get("EAGLE_PROFILE") == "1"
         spec_info: EagleVerifyInput = model_worker_batch.spec_info
         spec_info.allocate_lens = cur_allocate_lens
-        if _PROF:
-            _v0 = time.perf_counter()
         spec_info.prepare_for_verify(model_worker_batch, self.page_size, self.target_worker)
         forward_metadata = self.target_worker.model_runner.attn_backend.get_eagle_forward_metadata(
             model_worker_batch
         )
-        if _PROF:
-            jax.block_until_ready(forward_metadata.custom_mask)
-            _v1 = time.perf_counter()
 
         logits_output, _, cache_miss_count = self.target_worker.forward_batch_generation(
             model_worker_batch, skip_sample=True, forward_metadata=forward_metadata
@@ -518,9 +469,6 @@ class EAGLEWorker(ModelWorker):
         rep = NamedSharding(self.mesh, P())
         logits_output.next_token_logits = jax.device_put(logits_output.next_token_logits, rep)
         logits_output.hidden_states = jax.device_put(logits_output.hidden_states, rep)
-        if _PROF:
-            jax.block_until_ready(logits_output.next_token_logits)
-            _v2 = time.perf_counter()
         spec_info.hidden_states = logits_output.hidden_states
         (
             predict,
@@ -553,14 +501,6 @@ class EAGLEWorker(ModelWorker):
             hidden_states=logits_output.hidden_states,
         )
 
-        if _PROF:
-            _v3 = time.perf_counter()
-            logger.info(
-                "[EAGLE-VPROF] meta=%.1f fwd=%.1f sample=%.1f",
-                (_v1 - _v0) * 1e3,
-                (_v2 - _v1) * 1e3,
-                (_v3 - _v2) * 1e3,
-            )
         model_worker_batch.spec_info = next_draft_input
         return GenerationBatchResult(
             logits_output=logits_output,
@@ -673,19 +613,6 @@ class EAGLEWorker(ModelWorker):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.draft_model_runner)
         if forward_batch.input_ids.shape[0] <= 0:
             return
-        import os as _os
-
-        if _os.environ.get("EAGLE_PROFILE") == "1" and model_worker_batch.real_bs > 1:
-            md = self.draft_model_runner.attn_backend.forward_metadata
-            logger.info(
-                "[DEXT-DBG] bs=%d seq_lens=%s page_idx[:8]=%s cu_kv=%s cu_q=%s alloc=%s",
-                model_worker_batch.real_bs,
-                np.asarray(model_worker_batch.seq_lens).tolist(),
-                np.asarray(md.page_indices)[:8].tolist(),
-                np.asarray(md.cu_kv_lens).tolist(),
-                np.asarray(md.cu_q_lens).tolist(),
-                np.asarray(model_worker_batch.spec_info.allocate_lens).tolist(),
-            )
         draft_logits_output, _, _ = self.draft_model_runner.forward(
             forward_batch,
             logits_metadata=logits_meatadata,
@@ -877,11 +804,6 @@ class EAGLEWorker(ModelWorker):
 
         end_time = time.perf_counter()
         logger.info("[SPEC_DECODE] Precompile finished in %.0f secs", end_time - start_time)
-
-
-@jax.jit
-def _verify_post_gather(logits, hidden, positions, accept_index):
-    return logits[accept_index, :], hidden[accept_index, :], positions[accept_index]
 
 
 @functools.partial(jax.jit, static_argnames=["i", "topk"])
