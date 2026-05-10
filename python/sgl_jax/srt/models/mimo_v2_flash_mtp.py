@@ -21,7 +21,9 @@ Weight key convention (from HF safetensors)::
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
@@ -179,13 +181,30 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             model=self, model_config=model_config, mesh=self.mesh, dtype=self.dtype
         )
         is_fp8 = self.loader.is_static_quant
-        self.loader.load_weights_from_safetensors(self._create_weight_mappings(is_fp8))
+        # V2-Flash MTP ships split q/k/v; V2.5-Pro MTP ships fused qkv_proj. Peek
+        # the safetensors index so the same draft class handles both checkpoints.
+        is_fused_qkv = False
+        try:
+            idx_path = os.path.join(model_config.model_path, "model.safetensors.index.json")
+            with open(idx_path) as f:
+                wm = json.load(f)["weight_map"]
+            is_fused_qkv = "model.mtp.layers.0.self_attn.qkv_proj.weight" in wm
+        except (FileNotFoundError, KeyError):
+            pass
+        if is_fused_qkv:
+            self._fused_qkv_buffers: dict[int, dict] = {}
+        self.loader.load_weights_from_safetensors(
+            self._create_weight_mappings(is_fp8, is_fused_qkv)
+        )
         if is_fp8:
             head_dim = self.config.swa_head_dim
             v_head_dim = self.config.swa_v_head_dim
             layers = [self.model]
-            self.loader.dequant_fp8_layers(layers, specs=[("self_attn.q_proj", head_dim)])
-            self.loader.dequant_fused_kv(self._kv_buffers, layers, self.config)
+            if is_fused_qkv:
+                self.loader.dequant_fused_qkv(self._fused_qkv_buffers, layers, self.config)
+            else:
+                self.loader.dequant_fp8_layers(layers, specs=[("self_attn.q_proj", head_dim)])
+                self.loader.dequant_fused_kv(self._kv_buffers, layers, self.config)
             self.loader.dequant_fp8_layers(
                 layers,
                 specs=[
@@ -201,7 +220,7 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
             )
         logger.info("MiMo-V2 MTP draft weights loaded successfully!")
 
-    def _create_weight_mappings(self, is_fp8: bool) -> dict:
+    def _create_weight_mappings(self, is_fp8: bool, is_fused_qkv: bool = False) -> dict:
         prefix = "model.mtp.layers.0"
         m: dict[str, WeightMapping] = {
             "model.embed_tokens.weight": WeightMapping(
@@ -249,7 +268,19 @@ class MiMoV2FlashMTPForCausalLM(nnx.Module):
         # Mirror target weight loading: q_proj loads into QuantizedLinear and is
         # dequantised to bf16 post-load; K/V go through the fused per-head path
         # (#969); o_proj is bf16 in the checkpoint (ignored_layers).
-        if is_fp8:
+        if is_fp8 and is_fused_qkv:
+            # V2.5-Pro: per-shard-interleaved fused QKV → buffer for dequant_fused_qkv.
+            m[f"{prefix}.self_attn.qkv_proj.weight"] = WeightMapping(
+                target_path="__FUSED_QKV_WEIGHT__0",
+                sharding=(None, None),
+                transpose=False,
+            )
+            m[f"{prefix}.self_attn.qkv_proj.weight_scale_inv"] = WeightMapping(
+                target_path="__FUSED_QKV_SCALE__0",
+                sharding=(None, None),
+                transpose=False,
+            )
+        elif is_fp8:
             m[f"{prefix}.self_attn.q_proj.weight"] = WeightMapping(
                 target_path="model.self_attn.q_proj.weight_q",
                 sharding=(None, "tensor"),
