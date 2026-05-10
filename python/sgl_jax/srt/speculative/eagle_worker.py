@@ -265,7 +265,7 @@ class EAGLEWorker(ModelWorker):
         )
         vals = jax.device_get(tuple(getattr(model_worker_batch, n) for n in names))
         for n, v in zip(names, vals, strict=True):
-            setattr(model_worker_batch, n, np.asarray(v) if v is not None else None)
+            setattr(model_worker_batch, n, np.array(v, dtype=v.dtype) if v is not None else None)
 
     @property
     def draft_model_runner(self):
