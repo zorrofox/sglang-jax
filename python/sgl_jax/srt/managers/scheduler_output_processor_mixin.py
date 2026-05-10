@@ -347,7 +347,12 @@ class SchedulerOutputProcessorMixin:
                     # Non-spec path bumps kv_committed_len in prepare_for_decode
                     # (schedule_batch L1505); spec bypasses that, so do it here
                     # so cache_finished_req frees the verify-written KV slots.
+                    # Keep kv_allocated_len in sync so release_kv_cache's
+                    # committed==allocated assert holds; the spec-specific free
+                    # below handles the actual over-allocated [committed:allocate_lens]
+                    # range with the `!= 0` filter for page padding.
                     req.kv_committed_len += new_accepted_len
+                    req.kv_allocated_len = req.kv_committed_len
 
                 req.check_finished(new_accepted_len)
 
