@@ -344,19 +344,23 @@ class SchedulerOutputProcessorMixin:
                 elif self.spec_algorithm.is_eagle():
                     req.output_ids.extend([int(t) for t in next_token_id])
                     new_accepted_len = len(next_token_id)
+                    # Non-spec path bumps kv_committed_len in prepare_for_decode
+                    # (schedule_batch L1505); spec bypasses that, so do it here
+                    # so cache_finished_req frees the verify-written KV slots.
+                    req.kv_committed_len += new_accepted_len
 
                 req.check_finished(new_accepted_len)
 
                 if req.finished():
                     self.maybe_collect_routed_experts(req)
                     if batch.spec_algorithm is not None and batch.spec_algorithm.is_eagle():
-                        cur_allocate_len = info.spec_info.allocate_lens[i]
-                        all_token_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
-                        if self.page_size > 1:
-                            all_token_len = cdiv(all_token_len, self.page_size) * self.page_size
+                        cur_allocate_len = int(info.spec_info.allocate_lens[i])
+                        # cache_finished_req frees [0:kv_committed_len]; we free
+                        # the over-allocated remainder so the two ranges cover
+                        # [0:cur_allocate_len] exactly (no page-align gap).
                         kv_indices = self.req_to_token_pool.req_to_token[
                             req.req_pool_idx,
-                            all_token_len:cur_allocate_len,
+                            req.kv_committed_len:cur_allocate_len,
                         ]
                         kv_indices = kv_indices[kv_indices != 0]
                         from sgl_jax.srt.speculative.eagle_util import EagleDraftInput

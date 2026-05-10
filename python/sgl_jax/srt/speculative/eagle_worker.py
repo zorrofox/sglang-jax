@@ -842,8 +842,7 @@ def fast_topk(values, topk, axis=-1):
     return result_vals, result_indices
 
 
-# FIXME(pc) this should be jitted or convert as np.ndarray
-# @functools.partial(jax.jit, static_argnames=["i", "topk"])
+@functools.partial(jax.jit, static_argnames=["i", "topk"])
 def update_eagle_lists(
     i: int,
     score_list: jax.Array,
