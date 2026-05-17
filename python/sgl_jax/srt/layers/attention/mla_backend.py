@@ -273,11 +273,24 @@ class MLAAttentionBackend(AttentionBackend):
         del v
         q_rope = kwargs.get("q_rope")
         k_rope = kwargs.get("k_rope")
-        # DSA sparse top-k token indices [T, index_topk]. Decode-only; the Pallas
-        # sparse path is a follow-up — until then this is accepted and ignored so
-        # the indexer plumbing/cache can be exercised end-to-end.
+        # DSA sparse top-k: [B, index_topk] in-seq positions, decode-only.
+        # Convert to a per-seq token mask consumed by the Pallas kernel as an
+        # extra scalar-prefetch; the kernel ORs it into the causal mask so
+        # softmax only normalizes over the selected tokens.
         sparse_indices = kwargs.get("sparse_indices")
-        del sparse_indices
+        sparse_mask = None
+        if sparse_indices is not None:
+            bs = sparse_indices.shape[0]
+            mask_len = forward_batch.cache_loc.shape[0] // bs
+            max_pages = mask_len // self.page_size
+            valid = sparse_indices >= 0
+            page_idx = jnp.where(valid, sparse_indices // self.page_size, 0)
+            row = jnp.arange(bs, dtype=jnp.int32)[:, None]
+            sparse_mask = (
+                jnp.zeros((bs, max_pages), dtype=jnp.int32)
+                .at[row, page_idx]
+                .add(valid.astype(jnp.int32), out_sharding=P(self.attention_data_partition_axis, None))
+            )
         if q_rope is None or k_rope is None:
             raise ValueError(
                 "MLAAttentionBackend requires q_rope/k_rope kwargs (q_pe/k_pe) "
@@ -314,6 +327,7 @@ class MLAAttentionBackend(AttentionBackend):
             P(dpa),  # cu_q_lens
             P(dpa),  # cu_kv_lens
             P(dpa),  # distribution
+            P(dpa, None),  # sparse_mask [B, mask_len] or [1,1]
         )
         out_specs = (
             P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
@@ -331,6 +345,7 @@ class MLAAttentionBackend(AttentionBackend):
             cu_q_lens_,
             cu_kv_lens_,
             distribution_,
+            sparse_mask_,
         ):
             return mla_ragged_paged_attention(
                 ql_nope_,
@@ -343,6 +358,7 @@ class MLAAttentionBackend(AttentionBackend):
                 cu_q_lens_,
                 cu_kv_lens_,
                 distribution_,
+                sparse_mask=sparse_mask_ if sparse_mask_.shape[-1] > 1 else None,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
@@ -352,6 +368,8 @@ class MLAAttentionBackend(AttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
+        if sparse_mask is None:
+            sparse_mask = jnp.zeros((1, 1), dtype=jnp.int32)
         o_latent, updated_cache = jax.shard_map(
             _run,
             in_specs=in_specs,
@@ -368,6 +386,7 @@ class MLAAttentionBackend(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            sparse_mask,
         )
 
         return o_latent, updated_cache

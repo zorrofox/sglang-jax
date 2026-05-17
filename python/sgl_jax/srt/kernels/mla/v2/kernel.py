@@ -122,6 +122,7 @@ def static_validate_inputs(
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1]
     distribution: jax.Array,  # i32[3]
     *,
+    sparse_mask: jax.Array | None = None,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -260,6 +261,7 @@ def _mla_ragged_paged_attention_kernel(
     sem_ids_ref,  # [3] (bq_sem_idx, bkv_sem_idx, bo_sem_idx)
     bo_ids_ref,  # [4] (bo_sem_0_seq_idx, bo_sem_1_seq_idx, bo_sem_0_bo_idx, bo_sem_1_bo_idx)
     bkv_update_ids_ref,  # [batch_size, 6] (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz) * batch_size
+    sparse_mask_ref,  # i32[max_num_seqs, max_pages] or [1,1] sentinel; >0 ⇒ page has top-k token (DMA), 0 ⇒ skip
     # Input
     ql_nope_hbm_ref,  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, lkv_dim]
     q_pe_hbm_ref,  # [max_num_tokens, num_q_heads_per_q_packing, q_packing, r_dim]
@@ -304,6 +306,7 @@ def _mla_ragged_paged_attention_kernel(
     num_q_heads = num_q_heads_per_q_packing * q_packing
     total_num_pages, page_size_per_kv_packing, kv_packing, _ = cache_kv_hbm_ref.shape
     num_page_indices = page_indices_ref.shape[0]
+    use_sparse_mask = sparse_mask_ref.shape[-1] > 1
 
     q_dtype = ql_nope_hbm_ref.dtype
     # Validate against the KV dtype.
@@ -392,6 +395,13 @@ def _mla_ragged_paged_attention_kernel(
             mask = q_span < k_span
             if sliding_window is not None:
                 mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
+            if use_sparse_mask:
+                num_mask_pages = sparse_mask_ref.shape[-1]
+                block_active = jnp.int32(0)
+                for pi in range(bkv_p):
+                    mp = jnp.minimum(bkv_idx * bkv_p + pi, num_mask_pages - 1)
+                    block_active = block_active | sparse_mask_ref[seq_idx, mp]
+                mask = jnp.logical_or(mask, block_active <= 0)
             mask_list.append(mask)
         mask = jnp.stack(mask_list, axis=0)
 
@@ -458,6 +468,15 @@ def _mla_ragged_paged_attention_kernel(
 
             kv_left = jnp.maximum(kv_len - kv_len_start, 0)
             kv_left_frm_cache = jnp.maximum(kv_left - q_len, 0)
+            if use_sparse_mask:
+                num_mask_pages = sparse_mask_ref.shape[-1]
+                block_active = jnp.int32(0)
+                for pi in range(bkv_p):
+                    mp = jnp.minimum(kv_p_start + pi, num_mask_pages - 1)
+                    block_active = block_active | sparse_mask_ref[seq_idx, mp]
+                kv_left_frm_cache = kv_left_frm_cache * (block_active > 0).astype(
+                    kv_left_frm_cache.dtype
+                )
             kv_left_frm_cache_per_kv_packing = cdiv_on_kv_packing(kv_left_frm_cache, kv_packing)
             kv_left_frm_new = jnp.maximum(kv_left - kv_left_frm_cache, 0)
 
@@ -1352,6 +1371,7 @@ def mla_ragged_paged_attention(
     cu_kv_lens: jax.Array,  # i32[max_num_seqs + 1] (page-aligned cumsum)
     distribution: jax.Array,  # i32[3]
     *,
+    sparse_mask: jax.Array | None = None,
     sm_scale: float = 1.0,
     sliding_window: int | None = None,
     soft_cap: float | None = None,
@@ -1479,6 +1499,7 @@ def mla_ragged_paged_attention(
         num_queries_per_block: int,
         batch_size: int = 1,
         case: MlaCase = MlaCase.MIXED,
+        sparse_mask: jax.Array | None = None,
     ):
 
         bkv_p = num_kv_pages_per_block
@@ -1577,6 +1598,7 @@ def mla_ragged_paged_attention(
             jnp.full((4,), -1, jnp.int32),
             # (bkv_sem_0_seq_idx, bkv_sem_1_seq_idx, bkv_sem_0_offset, bkv_sem_1_offset, bkv_sem_0_sz, bkv_sem_1_sz) * batch_size
             jnp.full((batch_size, 6), -1, jnp.int32),
+            sparse_mask if sparse_mask is not None else jnp.zeros((1, 1), jnp.int32),
         )
 
         scope_name = f"MLA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}-bsz_{batch_size}"
@@ -1614,8 +1636,8 @@ def mla_ragged_paged_attention(
                     jax.ShapeDtypeStruct(shape=cache_kv.shape, dtype=cache_kv.dtype),
                 ],
                 input_output_aliases={
-                    8: 0,  # Alias output activation with ql_nope
-                    12: 1,  # Aliasing cache_kv with updated_cache_kv
+                    len(scalar_prefetches) + 0: 0,  # ql_nope → o
+                    len(scalar_prefetches) + 4: 1,  # cache_kv → updated_cache_kv
                 },
                 name=scope_name,
             )
@@ -1648,6 +1670,7 @@ def mla_ragged_paged_attention(
         static_q_len=1,
         batch_size=decode_batch_size,
         case=MlaCase.BATCHED_DECODE,
+        sparse_mask=sparse_mask,
     )
 
     # Decode-only
@@ -1668,6 +1691,7 @@ def mla_ragged_paged_attention(
         static_q_len=1,
         batch_size=1,
         case=MlaCase.DECODE,
+        sparse_mask=sparse_mask,
     )
     # TODO: evaluate if chunk-prefill-only branch is needed
 
