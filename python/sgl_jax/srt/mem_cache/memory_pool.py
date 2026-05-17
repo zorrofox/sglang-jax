@@ -1023,12 +1023,14 @@ class MLATokenToKVPool(KVCache):
         dp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
+        index_head_dim: int = 0,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
         self.dp_size = dp_size
+        self.index_head_dim = index_head_dim
 
         from sgl_jax.srt.kernels.mla.v2.kernel import align_to
 
@@ -1042,7 +1044,7 @@ class MLATokenToKVPool(KVCache):
     def tree_flatten(self):
         parent_children, parent_aux_data = super().tree_flatten()
 
-        children = (self.kv_buffer,) + parent_children
+        children = (self.kv_buffer, self.indexer_key_buffer) + parent_children
         aux_data = {
             **parent_aux_data,
             "kv_lora_rank": self.kv_lora_rank,
@@ -1053,13 +1055,15 @@ class MLATokenToKVPool(KVCache):
             "rope_dim": self.rope_dim,
             "kv_dim": self.kv_dim,
             "kv_sharding": self.kv_sharding,
+            "index_head_dim": self.index_head_dim,
         }
         return (children, aux_data)
 
     @classmethod
     def tree_unflatten(cls, aux_data, children):
         kv_buffer = children[0]
-        parent_children = children[1:] if len(children) > 1 else ()
+        indexer_key_buffer = children[1]
+        parent_children = children[2:] if len(children) > 2 else ()
 
         obj = object.__new__(cls)
 
@@ -1084,8 +1088,10 @@ class MLATokenToKVPool(KVCache):
         obj.rope_dim = aux_data["rope_dim"]
         obj.kv_dim = aux_data["kv_dim"]
         obj.kv_sharding = aux_data["kv_sharding"]
+        obj.index_head_dim = aux_data.get("index_head_dim", 0)
 
         obj.kv_buffer = kv_buffer
+        obj.indexer_key_buffer = indexer_key_buffer
 
         return obj
 
@@ -1144,6 +1150,21 @@ class MLATokenToKVPool(KVCache):
                 )()
                 self.kv_buffer.append(kv_buf)
 
+            # NSA/DSA indexer key cache: flat [size, index_head_dim] per layer.
+            # Replicated (single MQA key, no head axis to shard). Only allocated
+            # when the model declares index_head_dim > 0 (e.g. GLM-5.1).
+            self.indexer_key_buffer = None
+            if self.index_head_dim > 0:
+                idx_sharding = NamedSharding(self.mesh, P("data", None))
+                idx_shape = (self.size + self.page_size * self.dp_size, self.index_head_dim)
+                self.indexer_key_buffer = []
+                for _ in range(self.layer_num):
+                    idx_buf = jax.jit(
+                        lambda: jnp.zeros(shape=idx_shape, dtype=self.dtype),
+                        out_shardings=idx_sharding,
+                    )()
+                    self.indexer_key_buffer.append(idx_buf)
+
     def _calculate_memory_usage(self):
         """Calculate memory usage for the 4D paged MLA cache."""
         total_bytes = self._buffer_bytes() * self.layer_num
@@ -1175,6 +1196,11 @@ class MLATokenToKVPool(KVCache):
         """Return the 4D paged buffer; consumed directly by the MLA v2 kernel."""
         return self.kv_buffer[layer_id - self.start_layer]
 
+    def get_indexer_key_buffer(self, layer_id: int) -> jax.Array | None:
+        if self.indexer_key_buffer is None:
+            return None
+        return self.indexer_key_buffer[layer_id - self.start_layer]
+
     def get_kv_buffer(self, layer_id: int) -> tuple[jax.Array, jax.Array]:
         """Split the latent buffer into (c_kv, k_pe) views for non-kernel fallbacks."""
         buf = self.kv_buffer[layer_id - self.start_layer]
@@ -1199,8 +1225,16 @@ class MLATokenToKVPool(KVCache):
             "the MLA v2 kernel writes the cache in-place via input_output_aliases."
         )
 
-    def replace_buffer(self, kv_buffer: list[jax.Array]) -> None:
-        self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
+    def replace_buffer(self, kv_buffer: list) -> None:
+        if kv_buffer and isinstance(kv_buffer[0], tuple):
+            mla_bufs, idx_bufs = zip(*kv_buffer)
+            self.kv_buffer[self.start_layer : self.start_layer + len(mla_bufs)] = list(mla_bufs)
+            if self.indexer_key_buffer is not None:
+                self.indexer_key_buffer[self.start_layer : self.start_layer + len(idx_bufs)] = list(
+                    idx_bufs
+                )
+        else:
+            self.kv_buffer[self.start_layer : self.start_layer + len(kv_buffer)] = kv_buffer
 
     def get_cpu_copy(self, indices):
         """Get CPU copy of KV cache for specified indices.

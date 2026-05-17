@@ -273,6 +273,11 @@ class MLAAttentionBackend(AttentionBackend):
         del v
         q_rope = kwargs.get("q_rope")
         k_rope = kwargs.get("k_rope")
+        # DSA sparse top-k token indices [T, index_topk]. Decode-only; the Pallas
+        # sparse path is a follow-up — until then this is accepted and ignored so
+        # the indexer plumbing/cache can be exercised end-to-end.
+        sparse_indices = kwargs.get("sparse_indices")
+        del sparse_indices
         if q_rope is None or k_rope is None:
             raise ValueError(
                 "MLAAttentionBackend requires q_rope/k_rope kwargs (q_pe/k_pe) "

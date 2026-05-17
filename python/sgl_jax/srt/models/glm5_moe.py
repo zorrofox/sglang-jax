@@ -93,53 +93,85 @@ class GlmDsaIndexer(nnx.Module):
             scope_name="weights_proj",
         )
 
-    def __call__(
+    def _compute_qk(
         self, hidden_states: jax.Array, qr: jax.Array, positions: jax.Array, rotary_emb: Any
-    ) -> jax.Array:
-        # 1. Project Query and Key
+    ) -> tuple[jax.Array, jax.Array]:
         query, _ = self.wq_b(qr)
         query = query.reshape(-1, self.n_head, self.head_dim)
 
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
 
-        # Apply RoPE
         rope_dim = 64
         q_rope = query[:, :, :rope_dim]
         k_rope = key[:, :rope_dim]
-        k_rope = k_rope[:, None, :]  # Add head dim for RoPE
-
+        k_rope = k_rope[:, None, :]
         q_rope, k_rope = rotary_emb(positions, q_rope, k_rope)
-        k_rope = k_rope.squeeze(1)  # Remove head dim
-
+        k_rope = k_rope.squeeze(1)
         query = query.at[:, :, :rope_dim].set(q_rope)
         key = key.at[:, :rope_dim].set(k_rope)
 
-        # Apply Hadamard Transform
-        h_matrix = get_hadamard_matrix(128)
-        h_matrix = h_matrix * (128**-0.5)
-
+        h_matrix = get_hadamard_matrix(128) * (128**-0.5)
         query = jnp.einsum("thd,de->the", query, h_matrix)
         key = jnp.einsum("td,de->te", key, h_matrix)
+        return query, key
 
-        # 2. Compute Logits (simplified dense dot product)
-        key_replicated = jax.sharding.reshard(
-            key, jax.sharding.NamedSharding(self.mesh, P(None, None))
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        qr: jax.Array,
+        positions: jax.Array,
+        rotary_emb: Any,
+        forward_batch: ForwardBatch,
+        indexer_cache: jax.Array,
+        index_topk: int = 2048,
+    ) -> tuple[jax.Array | None, jax.Array]:
+        """Returns (topk_indices [T, index_topk] or None, updated_indexer_cache).
+
+        Reference (non-kernel) DSA indexer: writes the per-token indexer key to a
+        flat cache, then for decode steps gathers each request's full key history,
+        computes head-gated MQA logits and takes top-k. Prefill returns None
+        (chunked-prefill-size <= index_topk so dense MLA is already within budget).
+        """
+        query, key = self._compute_qk(hidden_states, qr, positions, rotary_emb)
+
+        out_cache_loc = forward_batch.out_cache_loc
+        updated_cache = indexer_cache.at[out_cache_loc].set(
+            key.astype(indexer_cache.dtype), out_sharding=P("data", None)
         )
-        logits = jnp.einsum("ijk,lk->ijl", query, key_replicated)
 
-        # 3. Apply weights_proj
-        weights, _ = self.weights_proj(hidden_states)
+        if forward_batch.forward_mode.is_decode():
+            bs = query.shape[0]
+            # cache_loc holds each request's full token-slot history, padded and
+            # concatenated; reshape to [B, L_padded] for per-request gather.
+            cache_loc_2d = forward_batch.cache_loc.reshape(bs, -1)
+            l_padded = cache_loc_2d.shape[1]
+            seq_lens = forward_batch.seq_lens
 
-        # Scale and apply weights
-        scaling = self.head_dim**-0.5
-        logits = logits * scaling * weights[:, :, None]
+            hist_k = updated_cache.at[cache_loc_2d].get(out_sharding=P("data", None, None))
+            logits = jnp.einsum(
+                "bhd,bld->bhl",
+                query.astype(jnp.float32),
+                hist_k.astype(jnp.float32),
+                out_sharding=P("data", None, None),
+            )
 
-        # 4. Top-K Selection (Top-1 for now to match dummy shape [T, n_head])
-        _, topk_ids = jax.lax.top_k(logits, 1)
-        topk_ids = topk_ids.squeeze(-1)
+            weights, _ = self.weights_proj(hidden_states)
+            weights = weights.astype(jnp.float32) * (self.n_head**-0.5)
+            scaling = self.head_dim**-0.5
+            logits = (logits * scaling * weights[:, :, None]).sum(axis=1)
 
-        return topk_ids
+            valid = jnp.arange(l_padded, dtype=jnp.int32)[None, :] < seq_lens[:, None]
+            logits = jnp.where(valid, logits, jnp.finfo(jnp.float32).min)
+
+            k = min(index_topk, l_padded)
+            _, topk_ids = jax.lax.top_k(logits, k)
+            if k < index_topk:
+                pad = jnp.full((bs, index_topk - k), -1, dtype=topk_ids.dtype)
+                topk_ids = jnp.concatenate([topk_ids, pad], axis=-1)
+            return topk_ids, updated_cache
+
+        return None, updated_cache
 
 
 class Glm5Attention(nnx.Module):
@@ -320,6 +352,7 @@ class Glm5Attention(nnx.Module):
         k_rope: jax.Array,
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
+        sparse_indices: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
         c_kv_3d = compressed[:, None, :]
@@ -331,6 +364,7 @@ class Glm5Attention(nnx.Module):
             token_to_kv_pool=token_to_kv_pool,
             q_rope=q_rope,
             k_rope=k_rope,
+            sparse_indices=sparse_indices,
         )
         o_v = jnp.einsum("thr,rhd->thd", attn_output, self.w_uv.value)
         attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
@@ -376,7 +410,15 @@ class Glm5Attention(nnx.Module):
         q, _ = self.q_b_proj(q_compressed)
         q = q.reshape(-1, self.num_heads, self.qk_head_dim)
 
-        _ = self.indexer(hidden_states, q_compressed, positions, self.rotary_emb)
+        indexer_cache = token_to_kv_pool.get_indexer_key_buffer(self.layer_id)
+        sparse_indices, updated_indexer_cache = self.indexer(
+            hidden_states,
+            q_compressed,
+            positions,
+            self.rotary_emb,
+            forward_batch,
+            indexer_cache,
+        )
 
         q_nope = q[:, :, : self.qk_nope_head_dim]
         q_rope = q[:, :, self.qk_nope_head_dim :]
@@ -390,7 +432,13 @@ class Glm5Attention(nnx.Module):
 
         if self.use_absorbed:
             attn_output, kv_fused = self._forward_mqa(
-                q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool
+                q_nope,
+                q_rope,
+                compressed,
+                k_rope,
+                forward_batch,
+                token_to_kv_pool,
+                sparse_indices=sparse_indices,
             )
         else:
             attn_output, kv_fused = self._forward_mha(
@@ -398,7 +446,7 @@ class Glm5Attention(nnx.Module):
             )
 
         output, _ = self.o_proj(attn_output)
-        return output, kv_fused
+        return output, (kv_fused, updated_indexer_cache)
 
 
 class Glm5MLP(nnx.Module):

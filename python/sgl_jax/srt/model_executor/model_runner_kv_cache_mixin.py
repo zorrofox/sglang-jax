@@ -208,6 +208,8 @@ class ModelRunnerKVCacheMixin:
             kv_packing = 32 // dtype_bits
             aligned_ps = (self.page_size + kv_packing - 1) // kv_packing * kv_packing
             per_token = kv_dim * aligned_ps * dtype_size // self.page_size
+            index_head_dim = getattr(cfg, "index_head_dim", 0)
+            per_token += index_head_dim * dtype_size
             return per_token * num_layers
 
         return (
@@ -481,6 +483,7 @@ class ModelRunnerKVCacheMixin:
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 dp_size=dp_size,
+                index_head_dim=getattr(hf_text_config, "index_head_dim", 0),
             )
         else:
             self.token_to_kv_pool = self._maybe_wrap_hybrid_kv_pool(
